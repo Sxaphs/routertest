@@ -3,7 +3,7 @@
 export interface Transaction {
   id: string;
   date: string;
-  type: "Top-up" | "Usage" | "Refund";
+  type: "Top-up" | "Usage" | "Refund" | "Withdrawal";
   amount: string; // 含符号，如 "+$50.00"
   /** 实付手续费（里程碑一新增列） */
   fee: string;
@@ -65,3 +65,23 @@ export const MOCK_REFUNDS: Refund[] = [
     status: "Processing",
   },
 ];
+
+/** 判断一笔流水的支付方式是否为 crypto 通道（入金分层依据） */
+export const isCryptoMethod = (method: string): boolean =>
+  /crypto|usdc|usdt|eth|sol/i.test(method);
+
+/** 风控：资金来源一致性（rail-consistency）。
+ * crypto 入金只能提现到 crypto 钱包；法币入金只能原路退款。
+ * 可提现额度 = crypto 入金 − crypto 提现（均按流水 method 判断）。
+ * TODO(backend): 该分层必须由后端在账本层保证，前端仅展示。
+ */
+export function cryptoWithdrawable(transactions: Transaction[]): number {
+  let v = 0;
+  for (const t of transactions) {
+    const n = Number(t.amount.replace(/[+$,]/g, ""));
+    if (!Number.isFinite(n)) continue;
+    if (t.type === "Top-up" && isCryptoMethod(t.method)) v += n;
+    if (t.type === "Withdrawal") v -= n;
+  }
+  return Math.max(0, Math.round(v * 100) / 100);
+}

@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import Link from "next/link";
 import { ExternalLink, Info, RefreshCw, ShieldCheck } from "lucide-react";
 import { brand } from "@/config/brand";
@@ -27,7 +27,12 @@ import {
   MOCK_REFUNDS,
   MOCK_TRANSACTIONS,
   type Refund,
+  type Transaction,
+  cryptoWithdrawable,
+  isCryptoMethod,
 } from "@/mocks/billing";
+import { CryptoTopup } from "@/components/crypto-topup";
+import { CryptoWithdraw } from "@/components/crypto-withdraw";
 
 /**
  * 余额与充值（全部 mock，TODO(backend): 接 OURBRAND 账单/支付）。
@@ -37,9 +42,56 @@ export default function CreditsPage() {
   const [crypto, setCrypto] = useState(false);
   const [balance] = useState("0.00"); // TODO(backend): 真实余额
   const [refunds, setRefunds] = useState<Refund[]>(MOCK_REFUNDS);
+  const [transactions, setTransactions] = useState<Transaction[]>(MOCK_TRANSACTIONS);
   const [refundOpen, setRefundOpen] = useState(false);
   const [refundAmount, setRefundAmount] = useState("");
   const [refundReason, setRefundReason] = useState("");
+  // 演示场景：?fiatonly 模拟纯法币用户（隐藏 crypto 流水 → 提现入口置灰）
+  const [fiatOnly, setFiatOnly] = useState(false);
+  useEffect(() => {
+    setFiatOnly(window.location.search.includes("fiatonly"));
+  }, []);
+  const visibleTx = fiatOnly
+    ? transactions.filter((t) => !isCryptoMethod(t.method))
+    : transactions;
+
+  /** crypto 支付完成回调（mock 入账记录，TODO(backend): 后端确认后入账） */
+  const onCryptoPaid = (amountUsd: string, txHash: string) => {
+    setTransactions((prev) => [
+      {
+        id: `tx-crypto-${txHash.slice(2, 8)}`,
+        date: "Oct 19, 2026",
+        type: "Top-up",
+        amount: `+$${amountUsd}`,
+        fee: "$0.00",
+        method: `Crypto ${txHash.slice(0, 10)}…`,
+        status: "Confirming",
+      },
+      ...prev,
+    ]);
+  };
+
+  /** crypto 提现回调：先入 Processing 记录，8s 后 mock 转为 Sent（TODO(backend): 后端回执驱动） */
+  const onCryptoWithdraw = (amountUsd: string, address: string, token: string) => {
+    const id = `wd-${Date.now().toString(36)}`;
+    setTransactions((prev) => [
+      {
+        id,
+        date: "Oct 19, 2026",
+        type: "Withdrawal",
+        amount: `-$${amountUsd}`,
+        fee: "$0.00",
+        method: `Crypto ${token} ${address.slice(0, 8)}…`,
+        status: "Processing",
+      },
+      ...prev,
+    ]);
+    setTimeout(() => {
+      setTransactions((prev) =>
+        prev.map((t) => (t.id === id ? { ...t, status: "Sent" } : t)),
+      );
+    }, 8000);
+  };
 
   const submitRefund = () => {
     // TODO(backend): 提交真实退款申请
@@ -126,12 +178,16 @@ export default function CreditsPage() {
                 <Switch checked={crypto} onCheckedChange={setCrypto} />
               </label>
             </div>
-            <Button
-              className="mt-4 w-full"
-              onClick={() => alert("Payments not wired yet (TODO(backend))")}
-            >
-              Add Credits
-            </Button>
+            {crypto ? (
+              <CryptoTopup onPaid={onCryptoPaid} />
+            ) : (
+              <Button
+                className="mt-4 w-full"
+                onClick={() => alert("Payments not wired yet (TODO(backend))")}
+              >
+                Add Credits
+              </Button>
+            )}
             <div className="mt-3 flex justify-between text-sm">
               <Link href="/activity" className="flex items-center gap-1 hover:underline">
                 View Usage <ExternalLink className="size-3" />
@@ -163,6 +219,19 @@ export default function CreditsPage() {
         </Card>
       </div>
 
+      {/* Crypto 提现（出金到钱包，自有功能；含 rail-consistency 风控） */}
+      <Card className="mt-4">
+        <CardContent className="pt-6">
+          <h2 className="font-semibold">Withdraw to Wallet</h2>
+          <div className="mt-4">
+            <CryptoWithdraw
+              withdrawable={cryptoWithdrawable(visibleTx)}
+              onWithdraw={onCryptoWithdraw}
+            />
+          </div>
+        </CardContent>
+      </Card>
+
       <h2 className="mt-10 text-lg font-bold">Recent Transactions</h2>
       <p className="mt-1 text-sm text-muted-foreground">
         Need enterprise billing options?{" "}
@@ -183,7 +252,7 @@ export default function CreditsPage() {
             </tr>
           </thead>
           <tbody>
-            {MOCK_TRANSACTIONS.map((t) => (
+            {visibleTx.map((t) => (
               <tr key={t.id} className="border-b last:border-0">
                 <td className="p-3 text-muted-foreground">{t.date}</td>
                 <td className="p-3">{t.type}</td>
