@@ -3,8 +3,8 @@ import { hashStr } from "./hash";
 
 /* ---------- 角色 ---------- */
 
-export const ROLE_STORAGE = "ourbrand.role"; // "user" | "distributor"
-export type Role = "user" | "distributor";
+export const ROLE_STORAGE = "ourbrand.role"; // "user" | "distributor" | "admin"
+export type Role = "user" | "distributor" | "admin";
 
 /* ---------- 概览仪表盘 ---------- */
 

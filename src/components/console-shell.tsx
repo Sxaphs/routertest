@@ -8,7 +8,7 @@ import { ThemeToggle } from "@/components/theme-toggle";
 import { PromoBanner } from "@/components/promo-banner";
 import { FuseBanner } from "@/components/fuse-banner";
 import { SearchPalette } from "@/components/search-palette";
-import { DistributionNavLink, RoleSwitcher } from "@/components/role-switcher";
+import { AdminNavLink, DistributionNavLink, RoleSwitcher } from "@/components/role-switcher";
 import { cn } from "@/lib/utils";
 
 /**
@@ -116,6 +116,7 @@ export function ConsoleShell({
               </Button>
             ))}
             <DistributionNavLink />
+            <AdminNavLink />
           </nav>
           <RoleSwitcher />
           <ThemeToggle />
