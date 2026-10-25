@@ -1,8 +1,8 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import Link from "next/link";
-import { ExternalLink, Info, RefreshCw, ShieldCheck } from "lucide-react";
+import { CreditCard, ExternalLink, Info, RefreshCw, ShieldCheck, Trash2 } from "lucide-react";
 import { brand } from "@/config/brand";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -28,69 +28,70 @@ import {
   MOCK_TRANSACTIONS,
   type Refund,
   type Transaction,
-  cryptoWithdrawable,
-  isCryptoMethod,
+  redeemPromoCode,
 } from "@/mocks/billing";
+import {
+  TX_STATUS_LABELS,
+  formatDate,
+  formatMoney,
+  formatSignedMoney,
+} from "@/lib/format";
+import {
+  paymentProvider,
+  type IntentStatus,
+  type SavedPaymentMethod,
+  type TopupIntent,
+} from "@/lib/payments";
 import { CryptoTopup } from "@/components/crypto-topup";
-import { CryptoWithdraw } from "@/components/crypto-withdraw";
+import { PaymentSheet } from "@/components/payment-sheet";
+
+/** 退款状态枚举 → 文案（展示归前端） */
+const REFUND_STATUS_LABELS: Record<Refund["status"], string> = {
+  processing: "Processing",
+  refunded: "Refunded to original payment method",
+};
 
 /**
  * 余额与充值（全部 mock，TODO(backend): 接 OURBRAND 账单/支付）。
- * 结构对齐参照站 /settings/credits。
+ * 充值统一走 Stripe 收银台模式（PaymentSheet + lib/payments 适配层）。
  */
 export default function CreditsPage() {
   const [crypto, setCrypto] = useState(false);
+  const [fiatSheetOpen, setFiatSheetOpen] = useState(false);
   const [balance] = useState("0.00"); // TODO(backend): 真实余额
   const [refunds, setRefunds] = useState<Refund[]>(MOCK_REFUNDS);
   const [transactions, setTransactions] = useState<Transaction[]>(MOCK_TRANSACTIONS);
   const [refundOpen, setRefundOpen] = useState(false);
   const [refundAmount, setRefundAmount] = useState("");
   const [refundReason, setRefundReason] = useState("");
-  // 演示场景：?fiatonly 模拟纯法币用户（隐藏 crypto 流水 → 提现入口置灰）
-  const [fiatOnly, setFiatOnly] = useState(false);
-  useEffect(() => {
-    setFiatOnly(window.location.search.includes("fiatonly"));
-  }, []);
-  const visibleTx = fiatOnly
-    ? transactions.filter((t) => !isCryptoMethod(t.method))
-    : transactions;
+  const [promoOpen, setPromoOpen] = useState(false);
+  const [promoCode, setPromoCode] = useState("");
+  const [promoMsg, setPromoMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [promoBusy, setPromoBusy] = useState(false);
+  const [pmOpen, setPmOpen] = useState(false);
+  const [payMethods, setPayMethods] = useState<SavedPaymentMethod[]>([]);
 
-  /** crypto 支付完成回调（mock 入账记录，TODO(backend): 后端确认后入账） */
-  const onCryptoPaid = (amountUsd: string, txHash: string) => {
-    setTransactions((prev) => [
-      {
-        id: `tx-crypto-${txHash.slice(2, 8)}`,
-        date: "Oct 19, 2026",
-        type: "Top-up",
-        amount: `+$${amountUsd}`,
-        fee: "$0.00",
-        method: `Crypto ${txHash.slice(0, 10)}…`,
-        status: "Confirming",
-      },
-      ...prev,
-    ]);
-  };
+  /** upsert 一条流水（按 id 覆盖，否则置顶插入） */
+  const upsertTx = (tx: Transaction) =>
+    setTransactions((prev) =>
+      prev.some((t) => t.id === tx.id)
+        ? prev.map((t) => (t.id === tx.id ? tx : t))
+        : [tx, ...prev],
+    );
 
-  /** crypto 提现回调：先入 Processing 记录，8s 后 mock 转为 Sent（TODO(backend): 后端回执驱动） */
-  const onCryptoWithdraw = (amountUsd: string, address: string, token: string) => {
-    const id = `wd-${Date.now().toString(36)}`;
-    setTransactions((prev) => [
-      {
-        id,
-        date: "Oct 19, 2026",
-        type: "Withdrawal",
-        amount: `-$${amountUsd}`,
-        fee: "$0.00",
-        method: `Crypto ${token} ${address.slice(0, 8)}…`,
-        status: "Processing",
-      },
-      ...prev,
-    ]);
-    setTimeout(() => {
-      setTransactions((prev) =>
-        prev.map((t) => (t.id === id ? { ...t, status: "Sent" } : t)),
-      );
-    }, 8000);
+  /** 充值 intent 状态驱动交易表（confirming → credited / failed）；
+   *  正式版由 webhook 入账，前端只轮询确认（TODO(backend)） */
+  const onTopupStatus = (intent: TopupIntent, status: IntentStatus) => {
+    upsertTx({
+      id: intent.intentId,
+      createdAt: new Date().toISOString(),
+      type: "Top-up",
+      amount: intent.amount,
+      currency: intent.currency,
+      fee: "0.00", // TODO(backend): 手续费由支付渠道回调写入
+      method: intent.rail === "crypto" ? "USDC via Stripe" : "Card via Stripe",
+      status,
+    });
   };
 
   const submitRefund = () => {
@@ -99,16 +100,51 @@ export default function CreditsPage() {
     setRefunds((prev) => [
       {
         id: `rf-${Date.now().toString(36)}`,
-        date: "Oct 14, 2026",
-        amount: `$${refundAmount}`,
+        createdAt: new Date().toISOString(),
+        amount: Number(refundAmount).toFixed(2),
+        currency: "USD",
         reason: refundReason || "User refund request",
-        status: "Processing",
+        status: "processing",
       },
       ...prev,
     ]);
     setRefundOpen(false);
     setRefundAmount("");
     setRefundReason("");
+  };
+
+  const submitPromo = async () => {
+    if (!promoCode.trim()) return;
+    setPromoBusy(true);
+    setPromoMsg(null);
+    try {
+      // TODO(backend): POST /v1/billing/promo-codes/redeem
+      const { credit } = await redeemPromoCode(promoCode);
+      upsertTx({
+        id: `promo-${Date.now().toString(36)}`,
+        createdAt: new Date().toISOString(),
+        type: "Top-up",
+        amount: credit,
+        currency: "USD",
+        fee: "0.00",
+        method: "Promo code",
+        status: "completed",
+      });
+      setPromoMsg({ ok: true, text: `${formatMoney(credit)} credit applied` });
+      setPromoCode("");
+    } catch (e) {
+      setPromoMsg({
+        ok: false,
+        text: e instanceof Error ? e.message : "Redeem failed",
+      });
+    } finally {
+      setPromoBusy(false);
+    }
+  };
+
+  const openPaymentMethods = async (open: boolean) => {
+    setPmOpen(open);
+    if (open) setPayMethods(await paymentProvider.listPaymentMethods());
   };
 
   return (
@@ -179,12 +215,14 @@ export default function CreditsPage() {
               </label>
             </div>
             {crypto ? (
-              <CryptoTopup onPaid={onCryptoPaid} />
+              <CryptoTopup onStatus={onTopupStatus} />
+            ) : fiatSheetOpen ? (
+              <div className="mt-4 rounded-lg border p-4">
+                <p className="mb-3 text-sm font-medium">Pay with card</p>
+                <PaymentSheet rail="fiat" onStatus={onTopupStatus} />
+              </div>
             ) : (
-              <Button
-                className="mt-4 w-full"
-                onClick={() => alert("Payments not wired yet (TODO(backend))")}
-              >
+              <Button className="mt-4 w-full" onClick={() => setFiatSheetOpen(true)}>
                 Add Credits
               </Button>
             )}
@@ -192,25 +230,116 @@ export default function CreditsPage() {
               <Link href="/activity" className="flex items-center gap-1 hover:underline">
                 View Usage <ExternalLink className="size-3" />
               </Link>
-              <button
-                className="hover:underline"
-                onClick={() => alert("Promo codes not wired yet (TODO(backend))")}
-              >
-                Redeem Promo Code
-              </button>
+              <Dialog open={promoOpen} onOpenChange={setPromoOpen}>
+                <DialogTrigger asChild>
+                  <button className="hover:underline">Redeem Promo Code</button>
+                </DialogTrigger>
+                <DialogContent>
+                  <DialogHeader>
+                    <DialogTitle>Redeem promo code</DialogTitle>
+                    <DialogDescription>
+                      Enter a promo code to apply credits to your balance.
+                      (mock: try WELCOME, TODO(backend))
+                    </DialogDescription>
+                  </DialogHeader>
+                  <div className="space-y-4">
+                    <div>
+                      <label className="text-sm" htmlFor="promo-code">
+                        Promo code
+                      </label>
+                      <Input
+                        id="promo-code"
+                        value={promoCode}
+                        onChange={(e) => setPromoCode(e.target.value)}
+                        placeholder="e.g. WELCOME"
+                      />
+                    </div>
+                    {promoMsg && (
+                      <p
+                        className={
+                          promoMsg.ok
+                            ? "text-sm text-emerald-600 dark:text-emerald-400"
+                            : "text-sm text-destructive"
+                        }
+                        role={promoMsg.ok ? undefined : "alert"}
+                      >
+                        {promoMsg.text}
+                      </p>
+                    )}
+                    <Button
+                      className="w-full"
+                      disabled={promoBusy || !promoCode.trim()}
+                      onClick={submitPromo}
+                    >
+                      {promoBusy ? "Redeeming…" : "Apply code"}
+                    </Button>
+                  </div>
+                </DialogContent>
+              </Dialog>
             </div>
           </CardContent>
         </Card>
         <Card>
           <CardContent className="pt-6">
             <h2 className="font-semibold">Auto Top-Up</h2>
-            <Button
-              variant="outline"
-              className="mt-4 w-full"
-              onClick={() => alert("Payment methods not wired yet (TODO(backend))")}
-            >
-              Add a Payment Method
-            </Button>
+            <Dialog open={pmOpen} onOpenChange={openPaymentMethods}>
+              <DialogTrigger asChild>
+                <Button variant="outline" className="mt-4 w-full">
+                  Add a Payment Method
+                </Button>
+              </DialogTrigger>
+              <DialogContent>
+                <DialogHeader>
+                  <DialogTitle>Payment methods</DialogTitle>
+                  <DialogDescription>
+                    Cards on file for top-ups and auto top-up. (mock, TODO(backend):
+                    GET/POST/DELETE /v1/billing/payment-methods)
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-2">
+                  {payMethods.map((m) => (
+                    <div
+                      key={m.id}
+                      className="flex items-center gap-2 rounded-md border p-3 text-sm"
+                    >
+                      <CreditCard className="size-4 text-muted-foreground" />
+                      <span className="capitalize">{m.brand}</span>
+                      <span className="font-mono">•• {m.last4}</span>
+                      <span className="text-muted-foreground">
+                        {String(m.expMonth).padStart(2, "0")}/{m.expYear}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="ml-auto"
+                        aria-label={`Remove ${m.brand} •• ${m.last4}`}
+                        onClick={async () => {
+                          await paymentProvider.deletePaymentMethod(m.id);
+                          setPayMethods(await paymentProvider.listPaymentMethods());
+                        }}
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </div>
+                  ))}
+                  {payMethods.length === 0 && (
+                    <p className="text-sm text-muted-foreground">
+                      No payment methods yet.
+                    </p>
+                  )}
+                  <Button
+                    variant="outline"
+                    className="w-full"
+                    onClick={async () => {
+                      await paymentProvider.addPaymentMethod();
+                      setPayMethods(await paymentProvider.listPaymentMethods());
+                    }}
+                  >
+                    Add card (mock)
+                  </Button>
+                </div>
+              </DialogContent>
+            </Dialog>
             <p className="mt-3 text-sm text-muted-foreground">
               To activate auto-top-up, you&apos;ll need a payment method that
               supports offline charging.
@@ -219,18 +348,8 @@ export default function CreditsPage() {
         </Card>
       </div>
 
-      {/* Crypto 提现（出金到钱包，自有功能；含 rail-consistency 风控） */}
-      <Card className="mt-4">
-        <CardContent className="pt-6">
-          <h2 className="font-semibold">Withdraw to Wallet</h2>
-          <div className="mt-4">
-            <CryptoWithdraw
-              withdrawable={cryptoWithdrawable(visibleTx)}
-              onWithdraw={onCryptoWithdraw}
-            />
-          </div>
-        </CardContent>
-      </Card>
+      {/* 出金 = 仅原路退款（卡退卡 / USDC 退 Stripe 关联原支付钱包）。
+          「提现到任意钱包」功能已按产品决策移除；如需恢复见 git 历史 */}
 
       <h2 className="mt-10 text-lg font-bold">Recent Transactions</h2>
       <p className="mt-1 text-sm text-muted-foreground">
@@ -239,7 +358,7 @@ export default function CreditsPage() {
           Contact sales
         </Link>
       </p>
-      {/* TODO(backend): 真实交易流水 */}
+      {/* TODO(backend): 真实交易流水 GET /v1/billing/transactions */}
       <div className="mt-4 overflow-x-auto rounded-lg border">
         <table className="w-full text-sm">
           <thead>
@@ -252,15 +371,23 @@ export default function CreditsPage() {
             </tr>
           </thead>
           <tbody>
-            {visibleTx.map((t) => (
+            {transactions.map((t) => (
               <tr key={t.id} className="border-b last:border-0">
-                <td className="p-3 text-muted-foreground">{t.date}</td>
+                <td className="p-3 text-muted-foreground">{formatDate(t.createdAt)}</td>
                 <td className="p-3">{t.type}</td>
-                <td className="p-3">{t.amount}</td>
-                <td className="p-3 text-muted-foreground">{t.fee}</td>
+                <td className="p-3">
+                  {formatSignedMoney(
+                    t.amount,
+                    t.currency,
+                    t.type === "Top-up" || t.type === "Refund" ? "in" : "out",
+                  )}
+                </td>
+                <td className="p-3 text-muted-foreground">
+                  {formatMoney(t.fee, t.currency)}
+                </td>
                 <td className="p-3 text-muted-foreground">{t.method}</td>
                 <td className="p-3">
-                  <Badge variant="secondary">{t.status}</Badge>
+                  <Badge variant="secondary">{TX_STATUS_LABELS[t.status]}</Badge>
                 </td>
               </tr>
             ))}
@@ -327,18 +454,18 @@ export default function CreditsPage() {
           <tbody>
             {refunds.map((r) => (
               <tr key={r.id} className="border-b last:border-0">
-                <td className="p-3 text-muted-foreground">{r.date}</td>
-                <td className="p-3">{r.amount}</td>
+                <td className="p-3 text-muted-foreground">{formatDate(r.createdAt)}</td>
+                <td className="p-3">{formatMoney(r.amount, r.currency)}</td>
                 <td className="p-3 text-muted-foreground">{r.reason}</td>
                 <td className="p-3">
                   <Badge
                     className={
-                      r.status === "Refunded to original payment method"
+                      r.status === "refunded"
                         ? "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400"
                         : "bg-amber-500/15 text-amber-600 dark:text-amber-400"
                     }
                   >
-                    {r.status}
+                    {REFUND_STATUS_LABELS[r.status]}
                   </Badge>
                 </td>
               </tr>
